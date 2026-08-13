@@ -376,10 +376,11 @@ static bool match2D(Value ptrTensor, Value maskVal, Access &out) {
 }
 
 /// Match a 2-D gather/scatter access with one data-dependent dimension and one
-/// regular dimension:
+/// regular dimension.  Accept the same two pointer forms as match2D and
+/// normalize both of them to base + row/column contributions:
 ///
-///   broadcast(addptr(splat(base), expand_dims(rowIndex, 1) * rowStride))
-///     + broadcast(expand_dims(colIndex, 0))
+///   Form 1: addptr(broadcast(addptr(splat(base), row)), broadcast(col))
+///   Form 2: addptr(splat(base), addi(broadcast(row), broadcast(col)))
 ///
 /// The data-dependent logical index is retained as the runtime tensor index.
 /// This matcher deliberately follows the regular 2-D matcher and therefore
@@ -388,50 +389,61 @@ static bool matchGatherScatter2D(Value ptrTensor, Access &out) {
   auto outer = ptrTensor.getDefiningOp<triton::AddPtrOp>();
   if (!outer)
     return false;
-  auto bcPtr = outer.getPtr().getDefiningOp<triton::BroadcastOp>();
-  auto bcOff = outer.getOffset().getDefiningOp<triton::BroadcastOp>();
-  if (!bcPtr || !bcOff)
-    return false;
 
-  auto colExp = bcOff.getSrc().getDefiningOp<triton::ExpandDimsOp>();
-  if (!colExp)
+  Value baseSrc, contribA, contribB;
+  if (auto bcPtr = outer.getPtr().getDefiningOp<triton::BroadcastOp>()) {
+    auto bcOff = outer.getOffset().getDefiningOp<triton::BroadcastOp>();
+    if (!bcOff)
+      return false;
+    auto innerAp = bcPtr.getSrc().getDefiningOp<triton::AddPtrOp>();
+    if (!innerAp)
+      return false;
+    auto splatBase = innerAp.getPtr().getDefiningOp<triton::SplatOp>();
+    if (!splatBase)
+      return false;
+    baseSrc = splatBase.getSrc();
+    contribA = innerAp.getOffset();
+    contribB = bcOff.getSrc();
+  } else if (auto splatBase = outer.getPtr().getDefiningOp<triton::SplatOp>()) {
+    auto add = outer.getOffset().getDefiningOp<arith::AddIOp>();
+    if (!add)
+      return false;
+    baseSrc = splatBase.getSrc();
+    contribA = add.getLhs();
+    contribB = add.getRhs();
+  } else {
     return false;
+  }
 
-  auto innerAp = bcPtr.getSrc().getDefiningOp<triton::AddPtrOp>();
-  if (!innerAp)
-    return false;
-  auto splatBase = innerAp.getPtr().getDefiningOp<triton::SplatOp>();
-  if (!splatBase)
-    return false;
-  auto tvPtr = dyn_cast<tv::PtrType>(splatBase.getSrc().getType());
+  auto tvPtr = dyn_cast<tv::PtrType>(baseSrc.getType());
   if (!tvPtr)
     return false;
 
-  Value rowContrib = innerAp.getOffset();
-  int64_t rowStride = 1;
+  int64_t strideA, strideB;
+  Value strideDynA, strideDynB;
+  auto expA = peelContribution(contribA, strideA, strideDynA);
+  auto expB = peelContribution(contribB, strideB, strideDynB);
+  if (!expA || !expB)
+    return false;
+
+  triton::ExpandDimsOp rowExpand, colExpand;
+  int64_t rowStride;
   Value rowStrideDyn;
-  Value rowExp;
-  if (auto mul = rowContrib.getDefiningOp<arith::MulIOp>()) {
-    for (Value operand : {mul.getLhs(), mul.getRhs()}) {
-      if (operand.getDefiningOp<triton::ExpandDimsOp>()) {
-        rowExp = operand;
-      } else if (auto c = getSplatConstIntValue(operand)) {
-        rowStride = *c;
-      } else if (auto s = operand.getDefiningOp<triton::SplatOp>()) {
-        rowStrideDyn = s.getSrc();
-        rowStride = ShapedType::kDynamic;
-      }
-    }
+  if (expA.getAxis() == 1 && expB.getAxis() == 0) {
+    rowExpand = expA;
+    colExpand = expB;
+    rowStride = strideA;
+    rowStrideDyn = strideDynA;
+  } else if (expA.getAxis() == 0 && expB.getAxis() == 1) {
+    rowExpand = expB;
+    colExpand = expA;
+    rowStride = strideB;
+    rowStrideDyn = strideDynB;
   } else {
-    rowExp = rowContrib;
+    return false;
   }
-  if (!rowExp)
-    return false;
-  auto rowExpand = rowExp.getDefiningOp<triton::ExpandDimsOp>();
-  if (!rowExpand)
-    return false;
   Value rowIndex = rowExpand.getSrc();
-  Value colIndexTensor = colExp.getSrc();
+  Value colIndexTensor = colExpand.getSrc();
 
   int64_t rowTile, rowTraversal, colTile, colTraversal;
   Value rowRegularIndex, colRegularIndex;
@@ -475,7 +487,7 @@ static bool matchGatherScatter2D(Value ptrTensor, Access &out) {
     sparseDims.push_back(0);
   }
 
-  out.basePtr = splatBase.getSrc();
+  out.basePtr = baseSrc;
   out.elementType = tvPtr.getPointeeType();
   out.rank = 2;
   out.tile = {rowTile, colTile};
@@ -657,7 +669,7 @@ static LogicalResult rewriteLoad(triton::LoadOp load) {
     Value view = buildView(b, loc, a);
     auto viewLoad = b.create<tv::ViewLoadOp>(
         loc, load.getResult().getType(), view, castIndices(b, loc, a),
-        /*mask=*/Value());
+        load.getMask());
     load.getResult().replaceAllUsesWith(viewLoad.getResult());
     load.erase();
     return success();
@@ -688,7 +700,7 @@ static LogicalResult rewriteStore(triton::StoreOp store) {
   if (matchAccess(store.getPtr(), store.getMask(), a)) {
     Value view = buildView(b, loc, a);
     b.create<tv::ViewStoreOp>(loc, view, store.getValue(),
-                              castIndices(b, loc, a), /*mask=*/Value());
+                              castIndices(b, loc, a), store.getMask());
     store.erase();
     return success();
   }

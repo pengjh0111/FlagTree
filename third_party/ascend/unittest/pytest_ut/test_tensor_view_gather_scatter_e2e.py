@@ -20,6 +20,7 @@
 
 """Hardware E2E for the TensorView gather/scatter lowering route."""
 
+import pytest
 import torch
 import torch_npu  # noqa: F401
 import triton
@@ -52,6 +53,26 @@ def tensor_view_gather_scatter_kernel(src_ptr, index_ptr, gather_out_ptr,
     tl.store(scatter_out_ptr + row_offsets + col_offsets, values)
 
 
+@triton.jit
+def tensor_view_gather_scatter_form2_masked_kernel(
+        src_ptr, index_ptr, gather_out_ptr, scatter_out_ptr, valid_rows,
+        COLS: tl.constexpr, TILE: tl.constexpr):
+    lanes = tl.arange(0, TILE)
+    sparse_rows = tl.load(index_ptr + lanes)
+    row_offsets = sparse_rows[:, None] * COLS
+    col_offsets = lanes[None, :]
+    offsets = row_offsets + col_offsets
+    mask = (lanes[:, None] < valid_rows) & (lanes[None, :] < COLS)
+
+    # Building the integer offset first and applying one pointer addition is
+    # Triton's Form 2.  Invalid tail indices are deliberately allowed here:
+    # the mask must keep them out of both gather reads and scatter writes.
+    values = tl.load(src_ptr + offsets, mask=mask, other=0.0)
+    dense_offsets = lanes[:, None] * COLS + col_offsets
+    tl.store(gather_out_ptr + dense_offsets, values)
+    tl.store(scatter_out_ptr + offsets, values, mask=mask)
+
+
 def test_tensor_view_gather_scatter_hardware_e2e():
     device = torch.device("npu")
     indices_cpu = torch.tensor([9, 2, 7, 0], dtype=torch.int32)
@@ -79,6 +100,45 @@ def test_tensor_view_gather_scatter_hardware_e2e():
     gather_ref = torch.index_select(src_cpu, 0, index64)
     scatter_ref = torch.full_like(src_cpu, -1.0)
     scatter_ref[index64, :] = gather_ref
+
+    torch.testing.assert_close(gather_out.cpu(), gather_ref, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(scatter_out.cpu(), scatter_ref, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("valid_rows", [3, 0])
+def test_tensor_view_gather_scatter_form2_masked_tail_hardware_e2e(valid_rows):
+    device = torch.device("npu")
+    valid_indices = [9, 2, 7]
+    # The masked lane contains an invalid address on purpose.  valid_rows=0
+    # additionally exercises the all-mask-false path.
+    index_values = (valid_indices + [1_000_000]
+                    if valid_rows else [1_000_000] * TILE)
+    indices_cpu = torch.tensor(index_values, dtype=torch.int32)
+    src_cpu = torch.arange(ROWS * COLS, dtype=torch.float32).reshape(ROWS, COLS)
+    indices = indices_cpu.to(device)
+    src = src_cpu.to(device)
+    gather_out = torch.full((TILE, COLS), -1.0, dtype=src.dtype, device=device)
+    scatter_out = torch.full_like(src, -1.0)
+
+    tensor_view_gather_scatter_form2_masked_kernel[(1, )](
+        src,
+        indices,
+        gather_out,
+        scatter_out,
+        valid_rows,
+        COLS=COLS,
+        TILE=TILE,
+        use_tensor_view=True,
+    )
+    torch.npu.synchronize()
+
+    gather_ref = torch.zeros((TILE, COLS), dtype=src_cpu.dtype)
+    scatter_ref = torch.full_like(src_cpu, -1.0)
+    if valid_rows:
+        index64 = indices_cpu[:valid_rows].to(torch.int64)
+        selected = torch.index_select(src_cpu, 0, index64)
+        gather_ref[:valid_rows, :] = selected
+        scatter_ref[index64, :] = selected
 
     torch.testing.assert_close(gather_out.cpu(), gather_ref, rtol=0.0, atol=0.0)
     torch.testing.assert_close(scatter_out.cpu(), scatter_ref, rtol=0.0, atol=0.0)

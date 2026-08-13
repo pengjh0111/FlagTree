@@ -393,9 +393,90 @@ static Value emitScalarGather(OpBuilder &b, Location loc, const ViewInfo &vi,
   return loops.front().getResult(0);
 }
 
+static Value emitScalarGmElem(OpBuilder &b, Location loc, Value base, Value ik,
+                              Type elemTy,
+                              hivm::AddressSpaceAttr gmSpace);
+
+/// Physical element offset for one gather/scatter result coordinate.
+static Value computeDiscreteOffset(OpBuilder &b, Location loc,
+                                   const ViewInfo &vi, ValueRange indices,
+                                   unsigned sparseDim, ValueRange coords) {
+  Value offset;
+  for (unsigned d = 0; d < vi.rank; ++d) {
+    Value logical;
+    if (d == sparseDim) {
+      logical = b.create<tensor::ExtractOp>(loc, indices[d], coords[d]);
+      logical = asIndex(b, loc, logical);
+    } else {
+      Value cTile = b.create<arith::ConstantIndexOp>(loc, vi.tile[d]);
+      Value origin = b.create<arith::MulIOp>(loc, indices[d], cTile);
+      logical = b.create<arith::AddIOp>(loc, origin, coords[d]);
+    }
+    Value phys = b.create<arith::MulIOp>(loc, logical, vi.strideVal[d]);
+    offset = offset ? b.create<arith::AddIOp>(loc, offset, phys) : phys;
+  }
+  return offset;
+}
+
+/// A masked gather cannot prefetch a rectangular window: an invalid lane may
+/// contain an arbitrary index and must neither contribute to a DMA span nor be
+/// read.  Guard each scalar GM access and use zero for masked lanes.
+static Value emitMaskedScalarGather(OpBuilder &b, Location loc,
+                                    const ViewInfo &vi, ValueRange indices,
+                                    unsigned sparseDim, Value mask,
+                                    RankedTensorType resultType,
+                                    hivm::AddressSpaceAttr gmSpace) {
+  auto zeroAttr = b.getZeroAttr(vi.elementType);
+  Value init = b.create<arith::ConstantOp>(
+      loc, resultType,
+      DenseElementsAttr::get(resultType, ArrayRef<Attribute>{zeroAttr}));
+  Value zero = b.create<arith::ConstantOp>(loc, zeroAttr);
+  Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
+  Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
+  SmallVector<scf::ForOp> loops;
+  SmallVector<Value> coords;
+
+  for (unsigned d = 0; d < vi.rank; ++d) {
+    Value iterArg = loops.empty() ? init : loops.back().getRegionIterArg(0);
+    Value upper = b.create<arith::ConstantIndexOp>(loc, vi.tile[d]);
+    auto loop = b.create<scf::ForOp>(loc, c0, upper, c1, iterArg);
+    if (!loops.empty())
+      b.create<scf::YieldOp>(loc, loop.getResult(0));
+    loops.push_back(loop);
+    b.setInsertionPointToStart(loop.getBody());
+    coords.push_back(loop.getInductionVar());
+  }
+
+  Value valid = b.create<tensor::ExtractOp>(loc, mask, coords);
+  auto guarded =
+      b.create<scf::IfOp>(loc, TypeRange{vi.elementType}, valid, true);
+  {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(guarded.thenBlock());
+    Value offset = computeDiscreteOffset(b, loc, vi, indices, sparseDim,
+                                         coords);
+    Value gm = emitScalarGmElem(b, loc, vi.base, offset, vi.elementType,
+                                gmSpace);
+    Value element = b.create<memref::LoadOp>(loc, gm, ValueRange{c0});
+    b.create<scf::YieldOp>(loc, element);
+  }
+  {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(guarded.elseBlock());
+    b.create<scf::YieldOp>(loc, zero);
+  }
+  Value target = loops.back().getRegionIterArg(0);
+  Value result =
+      b.create<tensor::InsertOp>(loc, guarded.getResult(0), target, coords);
+  b.create<scf::YieldOp>(loc, result);
+  b.setInsertionPointAfter(loops.front());
+  return loops.front().getResult(0);
+}
+
 /// Construct per-element physical offsets for hivm.hir.scatter_store.
 static Value emitScatterOffsets(OpBuilder &b, Location loc, const ViewInfo &vi,
-                                ValueRange indices, unsigned sparseDim) {
+                                ValueRange indices, unsigned sparseDim,
+                                Value mask = Value()) {
   auto offsetType = RankedTensorType::get(vi.tile, b.getI64Type());
   Value init = b.create<tensor::EmptyOp>(loc, offsetType.getShape(),
                                          offsetType.getElementType());
@@ -415,18 +496,25 @@ static Value emitScatterOffsets(OpBuilder &b, Location loc, const ViewInfo &vi,
   }
 
   Value offset;
-  for (unsigned d = 0; d < vi.rank; ++d) {
-    Value logical;
-    if (d == sparseDim) {
-      logical = b.create<tensor::ExtractOp>(loc, indices[d], coords[d]);
-      logical = asIndex(b, loc, logical);
-    } else {
-      Value cTile = b.create<arith::ConstantIndexOp>(loc, vi.tile[d]);
-      Value origin = b.create<arith::MulIOp>(loc, indices[d], cTile);
-      logical = b.create<arith::AddIOp>(loc, origin, coords[d]);
+  if (mask) {
+    Value valid = b.create<tensor::ExtractOp>(loc, mask, coords);
+    auto guarded =
+        b.create<scf::IfOp>(loc, TypeRange{b.getIndexType()}, valid, true);
+    {
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPointToStart(guarded.thenBlock());
+      Value validOffset = computeDiscreteOffset(b, loc, vi, indices,
+                                                sparseDim, coords);
+      b.create<scf::YieldOp>(loc, validOffset);
     }
-    Value phys = b.create<arith::MulIOp>(loc, logical, vi.strideVal[d]);
-    offset = offset ? b.create<arith::AddIOp>(loc, offset, phys) : phys;
+    {
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPointToStart(guarded.elseBlock());
+      b.create<scf::YieldOp>(loc, c0);
+    }
+    offset = guarded.getResult(0);
+  } else {
+    offset = computeDiscreteOffset(b, loc, vi, indices, sparseDim, coords);
   }
   Value offset64 = b.create<arith::IndexCastOp>(loc, b.getI64Type(), offset);
   Value target = loops.back().getRegionIterArg(0);
@@ -460,6 +548,17 @@ static LogicalResult lowerViewLoad(tv::ViewLoadOp load,
     for (unsigned d = 0; d < vi.rank; ++d)
       if (d != sparseDim && !load.getIndices()[d].getType().isIndex())
         return failure();
+
+    // VGather has no lane mask operand.  Do not build its rectangular DMA
+    // source window for masked accesses: invalid sparse indices must never
+    // affect the window span or issue a GM read.
+    if (Value mask = load.getMask()) {
+      Value result = emitMaskedScalarGather(
+          b, loc, vi, load.getIndices(), sparseDim, mask, tensorTy, gmSpace);
+      load.getResult().replaceAllUsesWith(result);
+      load.erase();
+      return success();
+    }
 
     Value sparseIndex = load.getIndices()[sparseDim];
     Value sparseSpan = vi.n[sparseDim];
@@ -548,8 +647,9 @@ static LogicalResult lowerViewStore(tv::ViewStoreOp store,
       if (d != sparseDim && !store.getIndices()[d].getType().isIndex())
         return failure();
 
-    Value offsets =
-        emitScatterOffsets(b, loc, vi, store.getIndices(), sparseDim);
+    Value mask = store.getMask();
+    Value offsets = emitScatterOffsets(b, loc, vi, store.getIndices(),
+                                       sparseDim, mask);
     int64_t burstLength = 1;
     int64_t expectedStride = 1;
     for (int64_t d = static_cast<int64_t>(vi.rank) - 1;
@@ -561,7 +661,7 @@ static LogicalResult lowerViewStore(tv::ViewStoreOp store,
     }
     Value burst = b.create<arith::ConstantIntOp>(loc, burstLength, 64);
     b.create<hivm::ScatterStoreOp>(
-        loc, TypeRange{}, offsets, store.getValue(), burst, Value(), vi.base,
+        loc, TypeRange{}, offsets, store.getValue(), burst, mask, vi.base,
         /*cache=*/nullptr, /*evict=*/nullptr);
     store.erase();
     return success();
