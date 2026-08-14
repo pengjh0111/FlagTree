@@ -26,6 +26,8 @@ Each case intentionally contains at most one discrete HIVM memory operation:
   scatter_only:   one regular dense load, followed by one scatter_store
 """
 
+import os
+
 import pytest
 import torch
 import torch_npu  # noqa: F401
@@ -36,6 +38,7 @@ import triton.language as tl
 ROWS = 12
 COLS = 4
 TILE = 4
+USE_BYTECODE = os.environ.get("TV_GS_DIAG_USE_BYTECODE", "1") != "0"
 
 
 @triton.jit
@@ -86,17 +89,20 @@ def test_tensor_view_gather_scatter_compile_isolation(case):
     if case == "dense_baseline":
         dst = torch.full((TILE, COLS), -1.0, dtype=src.dtype, device=device)
         tensor_view_dense_compile_baseline[(1, )](
-            src, dst, COLS=COLS, TILE=TILE, use_tensor_view=True)
+            src, dst, COLS=COLS, TILE=TILE, use_tensor_view=True,
+            use_bytecode=USE_BYTECODE)
         expected = src_cpu[:TILE, :]
     elif case == "gather_only":
         dst = torch.full((TILE, COLS), -1.0, dtype=src.dtype, device=device)
         tensor_view_gather_only_compile_isolation[(1, )](
-            src, indices, dst, COLS=COLS, TILE=TILE, use_tensor_view=True)
+            src, indices, dst, COLS=COLS, TILE=TILE, use_tensor_view=True,
+            use_bytecode=USE_BYTECODE)
         expected = torch.index_select(src_cpu, 0, indices_cpu.to(torch.int64))
     else:
         dst = torch.full_like(src, -1.0)
         tensor_view_scatter_only_compile_isolation[(1, )](
-            src, indices, dst, COLS=COLS, TILE=TILE, use_tensor_view=True)
+            src, indices, dst, COLS=COLS, TILE=TILE, use_tensor_view=True,
+            use_bytecode=USE_BYTECODE)
         expected = torch.full_like(src_cpu, -1.0)
         expected[indices_cpu.to(torch.int64), :] = src_cpu[:TILE, :]
 
