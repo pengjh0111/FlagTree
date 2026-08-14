@@ -223,179 +223,11 @@ static Value emitTailGeometry(OpBuilder &b, Location loc, const ViewInfo &vi,
   return off;
 }
 
-/// Return true for the sentinel used by Pass A when a raw pointer has no
-/// recoverable source extent.
-static bool isUnknownExtent(Value extent) {
-  auto constant = extent.getDefiningOp<arith::ConstantIndexOp>();
-  return constant && constant.value() == std::numeric_limits<int64_t>::max();
-}
-
 static Value asIndex(OpBuilder &b, Location loc, Value value) {
   if (value.getType().isIndex())
     return value;
   return b.create<arith::IndexCastOp>(loc, b.getIndexType(), value);
 }
-
-/// With no source extent available from a raw Triton pointer, materialize only
-/// the prefix needed by the sparse indices instead of allocating Pass A's
-/// INT64_MAX sentinel.  Negative/out-of-range indices retain the frontend's UB
-/// semantics.
-static Value computeSparseSpan(OpBuilder &b, Location loc, Value sparseIndex,
-                               int64_t length) {
-  Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
-  Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
-  Value upper = b.create<arith::ConstantIndexOp>(loc, length);
-  auto loop = b.create<scf::ForOp>(
-      loc, c0, upper, c1, ValueRange{c0},
-      [&](OpBuilder &nested, Location nestedLoc, Value iv, ValueRange args) {
-        Value idx =
-            nested.create<tensor::ExtractOp>(nestedLoc, sparseIndex, iv);
-        idx = asIndex(nested, nestedLoc, idx);
-        Value max = nested.create<arith::MaxSIOp>(nestedLoc, args[0], idx);
-        nested.create<scf::YieldOp>(nestedLoc, max);
-      });
-  return b.create<arith::AddIOp>(loc, loop.getResult(0), c1);
-}
-
-/// GM/local source window used before vgather or scalar gather decomposition.
-/// Regular dimensions contain one tile; the sparse dimension contains the
-/// addressable prefix [0, sparseSpan).
-struct GatherWindow {
-  Value local;
-  MemRefType localType;
-};
-
-static GatherWindow emitGatherWindow(OpBuilder &b, Location loc,
-                                     const ViewInfo &vi, ValueRange indices,
-                                     unsigned sparseDim, Value sparseSpan,
-                                     hivm::AddressSpaceAttr gmSpace) {
-  SmallVector<int64_t> shape(vi.tile.begin(), vi.tile.end());
-  shape[sparseDim] = ShapedType::kDynamic;
-  auto layout = StridedLayoutAttr::get(
-      b.getContext(), /*offset=*/ShapedType::kDynamic, vi.strideStatic);
-  auto gmTy = MemRefType::get(shape, vi.elementType, layout, gmSpace);
-
-  Value off;
-  for (unsigned d = 0; d < vi.rank; ++d) {
-    if (d == sparseDim)
-      continue;
-    Value cTile = b.create<arith::ConstantIndexOp>(loc, vi.tile[d]);
-    Value logical = b.create<arith::MulIOp>(loc, indices[d], cTile);
-    Value phys = b.create<arith::MulIOp>(loc, logical, vi.strideVal[d]);
-    off = off ? b.create<arith::AddIOp>(loc, off, phys) : phys;
-  }
-  if (!off)
-    off = b.create<arith::ConstantIndexOp>(loc, 0);
-
-  SmallVector<OpFoldResult> sizes, strides;
-  for (unsigned d = 0; d < vi.rank; ++d) {
-    sizes.push_back(d == sparseDim ? OpFoldResult(sparseSpan)
-                                   : OpFoldResult(b.getIndexAttr(vi.tile[d])));
-    strides.push_back(vi.strideStatic[d] == ShapedType::kDynamic
-                          ? OpFoldResult(vi.strideVal[d])
-                          : OpFoldResult(b.getIndexAttr(vi.strideStatic[d])));
-  }
-  Value gm = b.create<memref::ReinterpretCastOp>(
-      loc, gmTy, vi.base, OpFoldResult(off), sizes, strides);
-  auto localTy = MemRefType::get(shape, vi.elementType);
-  Value local = b.create<memref::AllocOp>(loc, localTy, ValueRange{sparseSpan});
-  b.create<hivm::LoadOp>(loc, TypeRange{}, gm, local);
-  return {local, localTy};
-}
-
-static Value castSparseTensorToI32(OpBuilder &b, Location loc, Value value) {
-  auto type = cast<RankedTensorType>(value.getType());
-  if (type.getElementType().isInteger(32))
-    return value;
-  auto i32Type = RankedTensorType::get(type.getShape(), b.getI32Type());
-  if (type.getElementType().isIndex())
-    return b.create<arith::IndexCastOp>(loc, i32Type, value);
-  return b.create<arith::TruncIOp>(loc, i32Type, value);
-}
-
-static bool supportsVGather(Type elementType) {
-  if (elementType.isF16() || elementType.isBF16() || elementType.isF32())
-    return true;
-  auto integerType = dyn_cast<IntegerType>(elementType);
-  return integerType &&
-         (integerType.getWidth() == 16 || integerType.getWidth() == 32);
-}
-
-/// Expand a rank-1 sparse index to rank N and broadcast it across all regular
-/// dimensions, producing the index shape required by hivm.hir.vgather.
-static Value broadcastSparseIndices(OpBuilder &b, Location loc,
-                                    const ViewInfo &vi, Value sparseIndex,
-                                    unsigned sparseDim) {
-  sparseIndex = castSparseTensorToI32(b, loc, sparseIndex);
-  SmallVector<int64_t> expandedShape(vi.rank, 1);
-  expandedShape[sparseDim] = vi.tile[sparseDim];
-  auto expandedType = RankedTensorType::get(expandedShape, b.getI32Type());
-  SmallVector<ReassociationIndices> reassociation(1);
-  for (unsigned d = 0; d < vi.rank; ++d)
-    reassociation[0].push_back(d);
-  Value expanded = b.create<tensor::ExpandShapeOp>(loc, expandedType,
-                                                   sparseIndex, reassociation);
-
-  auto expandedMemrefType =
-      MemRefType::get(expandedShape, b.getI32Type());
-#ifndef __LLVM_MAJOR_VERSION_22_COMPATIBLE__
-  Value expandedBuffer = b.create<bufferization::ToMemrefOp>(
-      loc, expandedMemrefType, expanded);
-#else
-  Value expandedBuffer = b.create<bufferization::ToBufferOp>(
-      loc, expandedMemrefType, expanded);
-#endif
-
-  auto fullType = MemRefType::get(vi.tile, b.getI32Type());
-  Value full = b.create<memref::AllocOp>(loc, fullType);
-  SmallVector<int64_t> broadcastDims;
-  for (unsigned d = 0; d < vi.rank; ++d)
-    if (d != sparseDim)
-      broadcastDims.push_back(d);
-  b.create<hivm::VBrcOp>(loc, TypeRange{}, expandedBuffer, full,
-                         b.getDenseI64ArrayAttr(broadcastDims));
-  return full;
-}
-
-/// Native AscendNPU-IR fallback for a gather axis that is not the last one:
-/// nested scalar tensor.extract/tensor.insert loops.
-static Value emitScalarGather(OpBuilder &b, Location loc, const ViewInfo &vi,
-                              Value source, Value sparseIndex,
-                              unsigned sparseDim, RankedTensorType resultType) {
-  Value init = b.create<tensor::EmptyOp>(loc, resultType.getShape(),
-                                         resultType.getElementType());
-  Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
-  Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
-  SmallVector<scf::ForOp> loops;
-  SmallVector<Value> coords;
-
-  for (unsigned d = 0; d < vi.rank; ++d) {
-    Value iterArg = loops.empty() ? init : loops.back().getRegionIterArg(0);
-    Value upper = b.create<arith::ConstantIndexOp>(loc, vi.tile[d]);
-    auto loop = b.create<scf::ForOp>(loc, c0, upper, c1, iterArg);
-    if (!loops.empty())
-      b.create<scf::YieldOp>(loc, loop.getResult(0));
-    loops.push_back(loop);
-    b.setInsertionPointToStart(loop.getBody());
-    coords.push_back(loop.getInductionVar());
-  }
-
-  Value sparse =
-      b.create<tensor::ExtractOp>(loc, sparseIndex, coords[sparseDim]);
-  sparse = asIndex(b, loc, sparse);
-  SmallVector<Value> sourceCoords(coords);
-  sourceCoords[sparseDim] = sparse;
-  Value element = b.create<tensor::ExtractOp>(loc, source, sourceCoords);
-  Value target = loops.back().getRegionIterArg(0);
-  Value result = b.create<tensor::InsertOp>(loc, element, target, coords);
-  b.create<scf::YieldOp>(loc, result);
-  b.setInsertionPointAfter(loops.front());
-  return loops.front().getResult(0);
-}
-
-static Value emitScalarGmElem(OpBuilder &b, Location loc, Value base, Value ik,
-                              Type elemTy,
-                              hivm::AddressSpaceAttr gmSpace);
 
 /// Physical element offset for one gather/scatter result coordinate.
 static Value computeDiscreteOffset(OpBuilder &b, Location loc,
@@ -418,62 +250,7 @@ static Value computeDiscreteOffset(OpBuilder &b, Location loc,
   return offset;
 }
 
-/// A masked gather cannot prefetch a rectangular window: an invalid lane may
-/// contain an arbitrary index and must neither contribute to a DMA span nor be
-/// read.  Guard each scalar GM access and use zero for masked lanes.
-static Value emitMaskedScalarGather(OpBuilder &b, Location loc,
-                                    const ViewInfo &vi, ValueRange indices,
-                                    unsigned sparseDim, Value mask,
-                                    RankedTensorType resultType,
-                                    hivm::AddressSpaceAttr gmSpace) {
-  auto zeroAttr = b.getZeroAttr(vi.elementType);
-  Value init = b.create<arith::ConstantOp>(
-      loc, resultType,
-      DenseElementsAttr::get(resultType, ArrayRef<Attribute>{zeroAttr}));
-  Value zero = b.create<arith::ConstantOp>(loc, zeroAttr);
-  Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
-  Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
-  SmallVector<scf::ForOp> loops;
-  SmallVector<Value> coords;
-
-  for (unsigned d = 0; d < vi.rank; ++d) {
-    Value iterArg = loops.empty() ? init : loops.back().getRegionIterArg(0);
-    Value upper = b.create<arith::ConstantIndexOp>(loc, vi.tile[d]);
-    auto loop = b.create<scf::ForOp>(loc, c0, upper, c1, iterArg);
-    if (!loops.empty())
-      b.create<scf::YieldOp>(loc, loop.getResult(0));
-    loops.push_back(loop);
-    b.setInsertionPointToStart(loop.getBody());
-    coords.push_back(loop.getInductionVar());
-  }
-
-  Value valid = b.create<tensor::ExtractOp>(loc, mask, coords);
-  auto guarded =
-      b.create<scf::IfOp>(loc, TypeRange{vi.elementType}, valid, true);
-  {
-    OpBuilder::InsertionGuard guard(b);
-    b.setInsertionPointToStart(guarded.thenBlock());
-    Value offset = computeDiscreteOffset(b, loc, vi, indices, sparseDim,
-                                         coords);
-    Value gm = emitScalarGmElem(b, loc, vi.base, offset, vi.elementType,
-                                gmSpace);
-    Value element = b.create<memref::LoadOp>(loc, gm, ValueRange{c0});
-    b.create<scf::YieldOp>(loc, element);
-  }
-  {
-    OpBuilder::InsertionGuard guard(b);
-    b.setInsertionPointToStart(guarded.elseBlock());
-    b.create<scf::YieldOp>(loc, zero);
-  }
-  Value target = loops.back().getRegionIterArg(0);
-  Value result =
-      b.create<tensor::InsertOp>(loc, guarded.getResult(0), target, coords);
-  b.create<scf::YieldOp>(loc, result);
-  b.setInsertionPointAfter(loops.front());
-  return loops.front().getResult(0);
-}
-
-/// Construct per-element physical offsets for hivm.hir.scatter_store.
+/// Construct static-tile-shaped physical offsets for HIVM gather/scatter.
 static Value emitScatterOffsets(OpBuilder &b, Location loc, const ViewInfo &vi,
                                 ValueRange indices, unsigned sparseDim,
                                 Value mask = Value()) {
@@ -524,6 +301,21 @@ static Value emitScatterOffsets(OpBuilder &b, Location loc, const ViewInfo &vi,
   return loops.front().getResult(0);
 }
 
+/// Number of contiguous elements following the sparse dimension.  HIVM uses
+/// this as the discrete DMA burst length while indices/data retain tile shape.
+static int64_t getDiscreteBurstLength(const ViewInfo &vi, unsigned sparseDim) {
+  int64_t burstLength = 1;
+  int64_t expectedStride = 1;
+  for (int64_t d = static_cast<int64_t>(vi.rank) - 1;
+       d > static_cast<int64_t>(sparseDim); --d) {
+    if (vi.strideStatic[d] != expectedStride)
+      break;
+    burstLength *= vi.tile[d];
+    expectedStride *= vi.tile[d];
+  }
+  return burstLength;
+}
+
 //===----------------------------------------------------------------------===//
 // Lowering.  Unmasked tiles DMA the full block (this clean form is what the
 // native cube path recognizes for tt.dot operands).  Masked tiles (any dim with
@@ -549,44 +341,19 @@ static LogicalResult lowerViewLoad(tv::ViewLoadOp load,
       if (d != sparseDim && !load.getIndices()[d].getType().isIndex())
         return failure();
 
-    // VGather has no lane mask operand.  Do not build its rectangular DMA
-    // source window for masked accesses: invalid sparse indices must never
-    // affect the window span or issue a GM read.
-    if (Value mask = load.getMask()) {
-      Value result = emitMaskedScalarGather(
-          b, loc, vi, load.getIndices(), sparseDim, mask, tensorTy, gmSpace);
-      load.getResult().replaceAllUsesWith(result);
-      load.erase();
-      return success();
-    }
-
-    Value sparseIndex = load.getIndices()[sparseDim];
-    Value sparseSpan = vi.n[sparseDim];
-    if (isUnknownExtent(sparseSpan))
-      sparseSpan = computeSparseSpan(b, loc, sparseIndex, vi.tile[sparseDim]);
-    GatherWindow window = emitGatherWindow(b, loc, vi, load.getIndices(),
-                                           sparseDim, sparseSpan, gmSpace);
-
-    Value result;
-    if (sparseDim == vi.rank - 1 && supportsVGather(vi.elementType)) {
-      Value fullIndices =
-          broadcastSparseIndices(b, loc, vi, sparseIndex, sparseDim);
-      auto resultMemrefType = MemRefType::get(vi.tile, vi.elementType);
-      Value resultBuffer = b.create<memref::AllocOp>(loc, resultMemrefType);
-      b.create<hivm::VGatherOp>(loc, TypeRange{}, window.local, fullIndices,
-                                resultBuffer);
-      result = b.create<bufferization::ToTensorOp>(
-          loc, tensorTy, resultBuffer, /*restrict=*/true, /*writable=*/false);
-    } else {
-      auto sourceTensorType =
-          RankedTensorType::get(window.localType.getShape(), vi.elementType);
-      Value source = b.create<bufferization::ToTensorOp>(
-          loc, sourceTensorType, window.local, /*restrict=*/true,
-          /*writable=*/false);
-      result = emitScalarGather(b, loc, vi, source, sparseIndex, sparseDim,
-                                tensorTy);
-    }
-    load.getResult().replaceAllUsesWith(result);
+    Value mask = load.getMask();
+    Value offsets =
+        emitScatterOffsets(b, loc, vi, load.getIndices(), sparseDim, mask);
+    Value burst = b.create<arith::ConstantIntOp>(
+        loc, getDiscreteBurstLength(vi, sparseDim), 64);
+    Value other;
+    if (mask)
+      other = b.create<arith::ConstantOp>(loc, b.getZeroAttr(vi.elementType));
+    Value init = b.create<tensor::EmptyOp>(loc, vi.tile, vi.elementType);
+    auto gather = b.create<hivm::GatherLoadOp>(
+        loc, TypeRange{tensorTy}, vi.base, offsets, burst, mask, other, init,
+        /*cache=*/nullptr, /*evict=*/nullptr, /*isVolatile=*/nullptr);
+    load.getResult().replaceAllUsesWith(gather->getResult(0));
     load.erase();
     return success();
   }
@@ -650,16 +417,8 @@ static LogicalResult lowerViewStore(tv::ViewStoreOp store,
     Value mask = store.getMask();
     Value offsets = emitScatterOffsets(b, loc, vi, store.getIndices(),
                                        sparseDim, mask);
-    int64_t burstLength = 1;
-    int64_t expectedStride = 1;
-    for (int64_t d = static_cast<int64_t>(vi.rank) - 1;
-         d > static_cast<int64_t>(sparseDim); --d) {
-      if (vi.strideStatic[d] != expectedStride)
-        break;
-      burstLength *= vi.tile[d];
-      expectedStride *= vi.tile[d];
-    }
-    Value burst = b.create<arith::ConstantIntOp>(loc, burstLength, 64);
+    Value burst = b.create<arith::ConstantIntOp>(
+        loc, getDiscreteBurstLength(vi, sparseDim), 64);
     b.create<hivm::ScatterStoreOp>(
         loc, TypeRange{}, offsets, store.getValue(), burst, mask, vi.base,
         /*cache=*/nullptr, /*evict=*/nullptr);

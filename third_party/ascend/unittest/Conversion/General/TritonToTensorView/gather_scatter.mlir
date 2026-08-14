@@ -10,7 +10,8 @@
 // E2E: hivm.hir.load
 // E2E: scf.for
 // E2E: scf.if
-// E2E: memref.load
+// E2E: tensor.empty() : tensor<4x4xf32>
+// E2E: hivm.hir.gather_load
 // E2E: hivm.hir.scatter_store
 tt.func public @gather_scatter_2d(%indices: !tt.ptr<i32>, %src: !tt.ptr<f32>,
                                   %dst: !tt.ptr<f32>,
@@ -76,10 +77,8 @@ tt.func public @gather_scatter_2d(%indices: !tt.ptr<i32>, %src: !tt.ptr<f32>,
 
 // CHECK-LABEL: tt.func public @gather_last_dim
 // E2E-LABEL: tt.func public @gather_last_dim
-// E2E: arith.maxsi
-// E2E: hivm.hir.load
-// E2E: hivm.hir.vbrc
-// E2E: hivm.hir.vgather
+// E2E: tensor.empty() : tensor<4x4xf32>
+// E2E: hivm.hir.gather_load
 // E2E: hivm.hir.store
 tt.func public @gather_last_dim(%src: !tt.ptr<f32>,
                                 %dst: !tt.ptr<f32>,
@@ -135,7 +134,8 @@ tt.func public @gather_last_dim(%src: !tt.ptr<f32>,
 // CHECK-LABEL: tt.func public @gather_scatter_form2_masked
 // E2E-LABEL: tt.func public @gather_scatter_form2_masked
 // E2E: scf.if
-// E2E: memref.load
+// E2E: tensor.empty() : tensor<4x4xf32>
+// E2E: hivm.hir.gather_load
 // E2E: hivm.hir.scatter_store
 tt.func public @gather_scatter_form2_masked(
     %src: !tt.ptr<f32>, %dst: !tt.ptr<f32>, %rows: tensor<4xi32>,
@@ -181,7 +181,9 @@ tt.func public @gather_scatter_form2_masked(
 
 // CHECK-LABEL: tt.func public @gather_form2_last_dim
 // E2E-LABEL: tt.func public @gather_form2_last_dim
-// E2E: hivm.hir.vgather
+// E2E: tensor.empty() : tensor<4x4xf32>
+// E2E: hivm.hir.gather_load
+// E2E: hivm.hir.scatter_store
 tt.func public @gather_form2_last_dim(
     %src: !tt.ptr<f32>, %dst: !tt.ptr<f32>, %cols: tensor<4xi32>) {
   %rows = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
@@ -209,6 +211,11 @@ tt.func public @gather_form2_last_dim(
   %dst_base = tt.splat %dst : !tt.ptr<f32> -> tensor<4x4x!tt.ptr<f32>>
   %dst_ptrs = tt.addptr %dst_base, %offsets
       : tensor<4x4x!tt.ptr<f32>>, tensor<4x4xi32>
+  // CHECK: tv.make_gather_scatter_view
+  // CHECK-SAME: sparse_dim = [1]
+  // CHECK: tv.view_store %{{[^ ]+}}[%{{[^ ]+}}, %{{[^ ]+}}], %{{[^, ]+}}
+  // CHECK-SAME: #tv.gather_scatter_view<tile = [4, 4], sparse_dim = [1], padding = zero>
+  // CHECK-SAME: tensor<4x4xf32>, index, tensor<4xi32>
   tt.store %dst_ptrs, %value : tensor<4x4x!tt.ptr<f32>>
   tt.return
 }
