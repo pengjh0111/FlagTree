@@ -44,6 +44,19 @@ namespace py = pybind11;
 using namespace ir;
 using namespace mlir;
 
+static triton::tv::PaddingValue
+parseTensorViewPaddingValue(const std::string &value) {
+  if (value == "zero")
+    return triton::tv::PaddingValue::ZERO;
+  if (value == "nan")
+    return triton::tv::PaddingValue::NAN_VALUE;
+  if (value == "inf")
+    return triton::tv::PaddingValue::POS_INF;
+  if (value == "-inf")
+    return triton::tv::PaddingValue::NEG_INF;
+  throw py::value_error("unknown TensorView padding value: " + value);
+}
+
 void init_triton_ascend_ir(py::module &&m) {
   auto *builder_cls = ir::getBuilderClass();
   builder_cls
@@ -359,22 +372,28 @@ void init_triton_ascend_ir(py::module &&m) {
            })
       .def("create_partition_view",
            [](TritonOpBuilder &self, Value view,
-              std::vector<int64_t> tile) -> Value {
+              std::vector<int64_t> tile, std::string paddingValue) -> Value {
              return triton::tv::createPartitionView(
-                 self.getBuilder(), self.getLastLoc(), view, tile);
+                 self.getBuilder(), self.getLastLoc(), view, tile,
+                 parseTensorViewPaddingValue(paddingValue));
            })
       .def("create_strided_view",
            [](TritonOpBuilder &self, Value view, std::vector<int64_t> tile,
-              std::vector<int64_t> traversalStrides) -> Value {
+              std::vector<int64_t> traversalStrides,
+              std::string paddingValue) -> Value {
              return triton::tv::createStridedView(self.getBuilder(),
                                                   self.getLastLoc(), view, tile,
-                                                  traversalStrides);
+                                                  traversalStrides,
+                                                  parseTensorViewPaddingValue(
+                                                      paddingValue));
            })
       .def("create_gather_scatter_view",
            [](TritonOpBuilder &self, Value view, std::vector<int64_t> tile,
-              std::vector<int64_t> sparseDims) -> Value {
+              std::vector<int64_t> sparseDims,
+              std::string paddingValue) -> Value {
              return triton::tv::createGatherScatterView(
-                 self.getBuilder(), self.getLastLoc(), view, tile, sparseDims);
+                 self.getBuilder(), self.getLastLoc(), view, tile, sparseDims,
+                 parseTensorViewPaddingValue(paddingValue));
            })
       .def("tensor_view_load",
            [](TritonOpBuilder &self, Value view, std::vector<Value> index,
@@ -414,19 +433,23 @@ void init_triton_ascend_ir(py::module &&m) {
            [](TritonOpBuilder &self, Type elementType, int64_t rank,
               std::string viewKind, std::vector<int64_t> tile,
               std::vector<int64_t> traversalStrides,
-              std::vector<int64_t> sparseDims) -> Type {
+              std::vector<int64_t> sparseDims,
+              std::string paddingValue) -> Type {
              llvm::SmallVector<int64_t> dynShape(rank, ShapedType::kDynamic);
              llvm::SmallVector<int64_t> dynStrides(rank, ShapedType::kDynamic);
              Attribute encoding;
+             triton::tv::PaddingValue padding =
+                 parseTensorViewPaddingValue(paddingValue);
              if (viewKind == "partition") {
                encoding = triton::tv::PartitionViewAttr::get(
-                   self.getBuilder().getContext(), tile);
+                   self.getBuilder().getContext(), tile, padding);
              } else if (viewKind == "strided") {
                encoding = triton::tv::StridedViewAttr::get(
-                   self.getBuilder().getContext(), tile, traversalStrides);
+                   self.getBuilder().getContext(), tile, traversalStrides,
+                   padding);
              } else if (viewKind == "gather_scatter") {
                encoding = triton::tv::GatherScatterViewAttr::get(
-                   self.getBuilder().getContext(), tile, sparseDims);
+                   self.getBuilder().getContext(), tile, sparseDims, padding);
              } else if (!viewKind.empty()) {
                throw py::value_error("unknown TensorView encoding: " +
                                      viewKind);

@@ -1996,37 +1996,50 @@ class TritonSemantic(Generic[TensorTy]):
             raise ValueError(f"Expected constant integers in `{name}`")
         return values
 
-    def make_partition_view(self, base: TensorTy, shape, strides, tile) -> "tl.tensor_view":
+    def _tensor_view_padding_value(self, value, element_ty):
+        value = tl._unwrap_if_constexpr(value)
+        if value not in ("zero", "nan", "inf", "-inf"):
+            raise ValueError("Expected `padding_value` to be one of: zero, nan, inf, -inf")
+        if value != "zero" and not element_ty.is_floating():
+            raise ValueError("Expected a floating-point TensorView for nan or infinity padding")
+        return value
+
+    def make_partition_view(self, base: TensorTy, shape, strides, tile, padding_value) -> "tl.tensor_view":
         view = self._make_tensor_view(base, shape, strides)
         tile = self._tensor_view_constants(tile, "tile", view.rank)
+        padding_value = self._tensor_view_padding_value(padding_value, view.dtype)
         if not all(value > 0 for value in tile):
             raise ValueError("Expected positive values in `tile`")
-        handle = self.builder.create_partition_view(view.handle, tile)
-        return tl.tensor_view(handle, view.dtype, view.rank, "partition", tile)
+        handle = self.builder.create_partition_view(view.handle, tile, padding_value)
+        return tl.tensor_view(handle, view.dtype, view.rank, "partition", tile, padding_value=padding_value)
 
     def make_strided_view(self, base: TensorTy, shape, strides, tile,
-                          traversal_strides) -> "tl.tensor_view":
+                          traversal_strides, padding_value) -> "tl.tensor_view":
         view = self._make_tensor_view(base, shape, strides)
         tile = self._tensor_view_constants(tile, "tile", view.rank)
         traversal = self._tensor_view_constants(traversal_strides, "traversal_strides", view.rank)
+        padding_value = self._tensor_view_padding_value(padding_value, view.dtype)
         if not all(value > 0 for value in tile + traversal):
             raise ValueError("Expected positive values in `tile` and `traversal_strides`")
-        handle = self.builder.create_strided_view(view.handle, tile, traversal)
-        return tl.tensor_view(handle, view.dtype, view.rank, "strided", tile, traversal)
+        handle = self.builder.create_strided_view(view.handle, tile, traversal, padding_value)
+        return tl.tensor_view(handle, view.dtype, view.rank, "strided", tile, traversal,
+                              padding_value=padding_value)
 
     def make_gather_scatter_view(self, base: TensorTy, shape, strides, tile,
-                                 sparse_dim) -> "tl.tensor_view":
+                                 sparse_dim, padding_value) -> "tl.tensor_view":
         view = self._make_tensor_view(base, shape, strides)
         tile = self._tensor_view_constants(tile, "tile", view.rank)
         sparse_dims = self._tensor_view_constants(sparse_dim, "sparse_dim")
+        padding_value = self._tensor_view_padding_value(padding_value, view.dtype)
         if not all(value > 0 for value in tile):
             raise ValueError("Expected positive values in `tile`")
         if not sparse_dims or len(set(sparse_dims)) != len(sparse_dims):
             raise ValueError("Expected at least one unique dimension in `sparse_dim`")
         if not all(0 <= value < view.rank for value in sparse_dims):
             raise ValueError(f"Expected `sparse_dim` entries in [0, {view.rank})")
-        handle = self.builder.create_gather_scatter_view(view.handle, tile, sparse_dims)
-        return tl.tensor_view(handle, view.dtype, view.rank, "gather_scatter", tile, (), sparse_dims)
+        handle = self.builder.create_gather_scatter_view(view.handle, tile, sparse_dims, padding_value)
+        return tl.tensor_view(handle, view.dtype, view.rank, "gather_scatter", tile, (), sparse_dims,
+                              padding_value)
 
     def _tensor_view_indices(self, view: "tl.tensor_view", index):
         rank = view.type.rank
