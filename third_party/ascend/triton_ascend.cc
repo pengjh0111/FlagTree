@@ -22,6 +22,9 @@
 #include "incubated/Conversion/TritonToLinalgIncubated/Passes.h"
 #include "incubated/Conversion/TritonToStructuredIncubated/Passes.h"
 #include "incubated/Conversion/TritonToUnstructureIncubated/Passes.h"
+#include "triton-shared/Conversion/TensorViewLowering/Passes.h"
+#include "triton-shared/Dialect/TensorView/IR/TensorViewDialect.h"
+#include "triton-shared/Dialect/TensorView/IR/TensorViewBuilder.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
 #include "ascend/include/DynamicCVPipeline/Passes.h"
@@ -335,6 +338,101 @@ void init_triton_ascend_ir(py::module &&m) {
              auto annotationOp = self.create<triton::ascend::AnnotationOp>(ptr);
              annotationOp->setAttr(self.getBuilder().getStringAttr(attrKey),
                                    attrVal);
+           })
+      // Convert or bridge a call argument to !tv.ptr.
+      .def("convert_to_tensor_view_ptr",
+           [](TritonOpBuilder &self, Value value) -> Value {
+             return triton::tv::convertToTensorViewPtr(value);
+           })
+      //===----------------------------------------------------------------===//
+      // Direct-construction API for `tl.tensor_view`.
+      //===----------------------------------------------------------------===//
+      .def("create_tensor_view",
+           [](TritonOpBuilder &self, Value base, std::vector<Value> shape,
+              std::vector<Value> strides) -> Value {
+             FailureOr<Value> view = triton::tv::createTensorViewBase(
+                 self.getBuilder(), self.getLastLoc(), base, shape, strides);
+             if (failed(view))
+               throw py::value_error(
+                   "TensorView base pointers must not contain pointer offsets");
+             return *view;
+           })
+      .def("create_partition_view",
+           [](TritonOpBuilder &self, Value view,
+              std::vector<int64_t> tile) -> Value {
+             return triton::tv::createPartitionView(
+                 self.getBuilder(), self.getLastLoc(), view, tile);
+           })
+      .def("create_strided_view",
+           [](TritonOpBuilder &self, Value view, std::vector<int64_t> tile,
+              std::vector<int64_t> traversalStrides) -> Value {
+             return triton::tv::createStridedView(self.getBuilder(),
+                                                  self.getLastLoc(), view, tile,
+                                                  traversalStrides);
+           })
+      .def("create_gather_scatter_view",
+           [](TritonOpBuilder &self, Value view, std::vector<int64_t> tile,
+              std::vector<int64_t> sparseDims) -> Value {
+             return triton::tv::createGatherScatterView(
+                 self.getBuilder(), self.getLastLoc(), view, tile, sparseDims);
+           })
+      .def("tensor_view_load",
+           [](TritonOpBuilder &self, Value view, std::vector<Value> index,
+              Type resultTy) -> Value {
+             return triton::tv::tensorViewLoad(
+                 self.getBuilder(), self.getLastLoc(), view, index, resultTy);
+           })
+      .def("tensor_view_store",
+           [](TritonOpBuilder &self, Value view, Value value,
+              std::vector<Value> index) -> void {
+             triton::tv::tensorViewStore(self.getBuilder(), self.getLastLoc(),
+                                         view, index, value);
+           })
+      .def("tensor_view_ptr_load",
+           [](TritonOpBuilder &self, Value pointers,
+              const std::vector<std::vector<int64_t>> &coordinates,
+              Type resultTy) -> Value {
+             llvm::SmallVector<llvm::ArrayRef<int64_t>> coordinateRefs;
+             for (const auto &coordinate : coordinates)
+               coordinateRefs.push_back(coordinate);
+             return triton::tv::tensorViewPtrLoad(self.getBuilder(),
+                                                  self.getLastLoc(), pointers,
+                                                  coordinateRefs, resultTy);
+           })
+      .def("tensor_view_ptr_store",
+           [](TritonOpBuilder &self, Value pointers, Value value,
+              const std::vector<std::vector<int64_t>> &coordinates) -> void {
+             llvm::SmallVector<llvm::ArrayRef<int64_t>> coordinateRefs;
+             for (const auto &coordinate : coordinates)
+               coordinateRefs.push_back(coordinate);
+             triton::tv::tensorViewPtrStore(self.getBuilder(),
+                                            self.getLastLoc(), pointers, value,
+                                            coordinateRefs);
+           })
+      // Build the TensorView type used across IR boundaries.
+      .def("get_tensor_view_ty",
+           [](TritonOpBuilder &self, Type elementType, int64_t rank,
+              std::string viewKind, std::vector<int64_t> tile,
+              std::vector<int64_t> traversalStrides,
+              std::vector<int64_t> sparseDims) -> Type {
+             llvm::SmallVector<int64_t> dynShape(rank, ShapedType::kDynamic);
+             llvm::SmallVector<int64_t> dynStrides(rank, ShapedType::kDynamic);
+             Attribute encoding;
+             if (viewKind == "partition") {
+               encoding = triton::tv::PartitionViewAttr::get(
+                   self.getBuilder().getContext(), tile);
+             } else if (viewKind == "strided") {
+               encoding = triton::tv::StridedViewAttr::get(
+                   self.getBuilder().getContext(), tile, traversalStrides);
+             } else if (viewKind == "gather_scatter") {
+               encoding = triton::tv::GatherScatterViewAttr::get(
+                   self.getBuilder().getContext(), tile, sparseDims);
+             } else if (!viewKind.empty()) {
+               throw py::value_error("unknown TensorView encoding: " +
+                                     viewKind);
+             }
+             return triton::tv::TensorViewType::get(dynShape, elementType,
+                                                    dynStrides, encoding);
            });
 }
 
@@ -393,6 +491,10 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
     pm.addPass(mlir::triton::createTritonToHIVMPass());
   });
 
+  m.def("add_tensor_view_lowering", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createTensorViewLoweringPass());
+  });
+
 #ifdef __TLE_DSA__
   m.def("add_commonir_to_hivm", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createCommonIRToHIVMPass());
@@ -442,7 +544,8 @@ void init_triton_ascend(py::module &&m) {
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
-    registry.insert<mlir::triton::ascend::TritonAscendDialect>();
+    registry.insert<mlir::triton::ascend::TritonAscendDialect,
+                    mlir::triton::tv::TensorViewDialect>();
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });
