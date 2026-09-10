@@ -49,6 +49,19 @@ def partition_view_padding_kernel(src, dst, src_elements, dst_elements, BLOCK_SI
     tl.store(dst_tiles, value, index=(block, ))
 
 
+@triton.jit
+def partition_view_unit_dims_kernel(src, dst):
+    src_tiles = tl.make_partition_view(src, (1, 1, 32, 32),
+                                       (1024, 1024, 32, 1),
+                                       (1, 1, 32, 32))
+    dst_tiles = tl.make_partition_view(dst, (1, 1, 32, 32),
+                                       (1024, 1024, 32, 1),
+                                       (1, 1, 32, 32))
+
+    value = tl.load(src_tiles, index=(0, 0, 0, 0))
+    tl.store(dst_tiles, value, index=(0, 0, 0, 0))
+
+
 def test_tensor_view_partition_load_store():
     rows = 128
     cols = 128
@@ -75,3 +88,12 @@ def test_tensor_view_partition_padding():
     expected = torch.full_like(actual, -torch.inf)
     expected[:src_elements] = src
     torch.testing.assert_close(actual, expected)
+
+
+def test_tensor_view_partition_unit_dims():
+    src = torch.rand(1024, device="npu")
+    actual = torch.zeros_like(src)
+
+    partition_view_unit_dims_kernel[(1, )](src, actual)
+
+    torch.testing.assert_close(actual, src)
