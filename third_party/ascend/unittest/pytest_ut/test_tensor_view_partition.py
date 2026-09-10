@@ -50,16 +50,22 @@ def partition_view_padding_kernel(src, dst, src_elements, dst_elements, BLOCK_SI
 
 
 @triton.jit
-def partition_view_unit_dims_kernel(src, dst):
-    src_tiles = tl.make_partition_view(src, (1, 1, 32, 32),
+def partition_view_unit_dims_kernel(lhs, rhs, dst):
+    lhs_tiles = tl.make_partition_view(lhs, (1, 1, 32, 32),
                                        (1024, 1024, 32, 1),
                                        (1, 1, 32, 32))
-    dst_tiles = tl.make_partition_view(dst, (1, 1, 32, 32),
+    rhs_tiles = tl.make_partition_view(rhs, (1, 1, 32, 32),
                                        (1024, 1024, 32, 1),
                                        (1, 1, 32, 32))
+    dst_tiles = tl.make_partition_view(dst, (32, 32), (32, 1),
+                                       (32, 32))
 
-    value = tl.load(src_tiles, index=(0, 0, 0, 0))
-    tl.store(dst_tiles, value, index=(0, 0, 0, 0))
+    lhs_block = tl.reshape(tl.load(lhs_tiles, index=(0, 0, 0, 0)),
+                           (32, 32))
+    rhs_block = tl.reshape(tl.load(rhs_tiles, index=(0, 0, 0, 0)),
+                           (32, 32))
+    result = tl.dot(lhs_block, tl.trans(rhs_block))
+    tl.store(dst_tiles, result, index=(0, 0))
 
 
 def test_tensor_view_partition_load_store():
@@ -91,9 +97,11 @@ def test_tensor_view_partition_padding():
 
 
 def test_tensor_view_partition_unit_dims():
-    src = torch.rand(1024, device="npu")
-    actual = torch.zeros_like(src)
+    lhs = torch.rand((32, 32), dtype=torch.float16, device="npu")
+    rhs = torch.rand((32, 32), dtype=torch.float16, device="npu")
+    actual = torch.zeros((32, 32), dtype=torch.float32, device="npu")
 
-    partition_view_unit_dims_kernel[(1, )](src, actual)
+    partition_view_unit_dims_kernel[(1, )](lhs, rhs, actual)
 
-    torch.testing.assert_close(actual, src)
+    expected = torch.matmul(lhs.float(), rhs.float().T)
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
