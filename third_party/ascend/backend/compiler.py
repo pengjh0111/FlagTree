@@ -407,13 +407,6 @@ def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: s
     dump_manager.put(Path(output_path).read_text(encoding='utf-8'), "kernel.npuir.mlir", binary=False)
 
 
-def _save_bishengir_pass_dump(stderr_bytes: bytes, dump_path: str):
-    path = Path(dump_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(stderr_bytes or b'')
-    print(f"[bishengir] Pass IR dump written to: {path}")
-
-
 def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
     linalg, metadata = _parse_linalg_metadata(linalg, metadata)
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -590,10 +583,6 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if opt.debug:
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
-        bishengir_dump_path = os.environ.get("BISHENGIR_DUMP_PATH", "")
-        if bishengir_dump_path:
-            _compile_option_list += ["--mlir-print-ir-after-all"]
-
         _append_custom_pipeline_option(_compile_option_list, metadata)
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
         vf_merge_level = metadata["vf_merge_level"]
@@ -610,14 +599,10 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         try:
             ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         except subprocess.CalledProcessError as e:
-            if bishengir_dump_path:
-                _save_bishengir_pass_dump(e.stderr, bishengir_dump_path)
             if opt.debug:
                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
             raise
 
-        if bishengir_dump_path:
-            _save_bishengir_pass_dump(ret.stderr, bishengir_dump_path)
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
 
@@ -844,9 +829,6 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         if opt.debug:
             _compile_option_list += ["--mlir-print-ir-after-failure"]
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
-        bishengir_dump_path = os.environ.get("BISHENGIR_DUMP_PATH", "")
-        if bishengir_dump_path:
-            _compile_option_list += ["--mlir-print-ir-after-all"]
         _append_custom_pipeline_option(_compile_option_list, metadata)
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
         if opt.debug:
@@ -858,16 +840,18 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         try:
             ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         except subprocess.CalledProcessError as e:
-            if bishengir_dump_path:
-                _save_bishengir_pass_dump(e.stderr, bishengir_dump_path)
             if opt.debug:
                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
             raise
 
-        if bishengir_dump_path:
-            _save_bishengir_pass_dump(ret.stderr, bishengir_dump_path)
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
+
+        if "--mlir-print-ir-after-all" in _compile_option_list:
+            dump_path = os.environ.get("BISHENGIR_DUMP_PATH", os.path.join(tmpdir, "bishengir_pass_dump.log"))
+            with open(dump_path, "w") as f:
+                f.write(ret.stderr.decode("utf-8", errors="replace"))
+            print(f"[bishengir] Pass IR dump written to: {dump_path}")
 
         stdout_str = ret.stdout.decode('utf-8') if ret.stdout else ''
         match = re.search(r'UB\s+size\s*=\s*(\d+)\s*bits', stdout_str)
