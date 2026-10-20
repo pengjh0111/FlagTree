@@ -569,6 +569,7 @@ void init_triton_ascend(py::module &&m) {
     mlir::DialectRegistry registry;
     registry.insert<mlir::triton::ascend::TritonAscendDialect,
                     mlir::triton::tv::TensorViewDialect>();
+    mlir::triton::tv::registerTritonPointerInterface(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });

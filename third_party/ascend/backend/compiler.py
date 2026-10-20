@@ -153,7 +153,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         ascend.passes.ttir.add_triton_to_llvm(pm)
 
         # Lower TensorView operations at the native bufferization boundary.
-        ascend.passes.ttir.add_tensor_view_lowering(pm)
+        if opt.enable_tensor_view_decompose:
+            ascend.passes.ttir.add_tensor_view_lowering(pm)
 
         ascend.passes.ttir.add_bubble_up_operation(pm)
         ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
@@ -229,11 +230,14 @@ def linalg_to_bc_by_triton_mlir_opt(linalg: str, metadata, opt):
 
         triton_mlir_opt_path = _get_triton_mlir_opt_path()
 
-        # The --emit-bytecode flag ensures output is in BC format
+        # LLVM 19 reads operation properties through the attribute dictionary.
+        bytecode_options = ["--emit-bytecode"]
+        if not opt.enable_tensor_view_decompose:
+            bytecode_options.append("--emit-bytecode-version=0")
         subprocess.run([
             triton_mlir_opt_path,
             ttadapter_path,
-            "--emit-bytecode",
+            *bytecode_options,
             "-o",
             bc_path,
         ], check=True, capture_output=True, text=True)
@@ -379,6 +383,8 @@ def get_common_bishengir_compile_options(metadata):
     return [bishengir_target_opt]
 
 def _append_custom_pipeline_option(compile_options, metadata):
+    if not metadata.get("enable_tensor_view_decompose", True):
+        compile_options.append("--enable-tensor-view-decompose=false")
     custom_pipeline = metadata.get("custom_pipeline")
     enable_custom_pipeline = custom_pipeline is not None
     if enable_custom_pipeline:
@@ -903,6 +909,7 @@ class NPUOptions:
     enable_auto_blockify: bool = None
     compile_on_910_95: bool = is_compile_on_910_95
     optimize_dynamic_offset: bool = False
+    enable_tensor_view_decompose: bool = True
     enable_mask_fallback_conversion: bool = False
     enable_warp_specialization: bool = False
     enable_nd2nz_on_vector: bool = False
@@ -993,6 +1000,9 @@ class NPUOptions:
         elif self.compile_mode == "simt_only":
             object.__setattr__(self, "force_simt_only", True)
             object.__setattr__(self, "parallel_mode", "simt")
+
+        if not self.enable_tensor_view_decompose and self.force_simt_only:
+            raise ValueError("TensorView passthrough requires the SIMD compilation pipeline")
 
         if self.force_simt_only:
             if self.shared_mem_dynamic_size is None:

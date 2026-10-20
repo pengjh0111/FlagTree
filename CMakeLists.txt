@@ -55,7 +55,8 @@ elseif(FLAGTREE_BACKEND STREQUAL "ascend")
   # AscendNPU-IR
   set(BISHENGIR_ENABLE_A5_UNPUBLISHED_FEATURES ON)
   set(BISHENGIR_BUILD_STANDALONE_IR_ONLY ON)
-  set(ASCENDNPU_IR_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ascend/AscendNPU-IR)
+  set(ASCENDNPU_IR_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ascend/AscendNPU-IR
+      CACHE PATH "AscendNPU-IR source checkout")
   set(ASCENDNPU_IR_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/third_party/ascend/AscendNPU-IR)
   include_directories(${ASCENDNPU_IR_SRC_DIR}/bishengir/include)
   include_directories(${ASCENDNPU_IR_BINARY_DIR}/bishengir/include)
@@ -340,7 +341,12 @@ if (NOT WIN32 AND NOT APPLE AND NOT BSD)
   link_libraries(stdc++fs)
 endif()
 
+set(FLIR_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/flir
+    CACHE PATH "FLIR source checkout")
+
 if(FLAGTREE_BACKEND STREQUAL "ascend")
+  set(BISHENGIR_TENSOR_VIEW_SOURCE_DIR ${FLIR_SOURCE_DIR} CACHE PATH
+      "FLIR checkout providing the TensorView dialect")
   add_subdirectory(${ASCENDNPU_IR_SRC_DIR} ${ASCENDNPU_IR_BINARY_DIR})
 endif()
 
@@ -372,7 +378,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
   if(FLAGTREE_BACKEND STREQUAL "ascend")
     list(APPEND TRITON_PLUGIN_NAMES "flir")
-    add_subdirectory(third_party/flir)
+    add_subdirectory(${FLIR_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/third_party/flir)
   endif()
 
   # Backend codegen targets capture TRITON_LIBS at configuration time.
@@ -619,7 +625,7 @@ endif()
 if(NOT TRITON_BUILD_PYTHON_MODULE)
   add_subdirectory(third_party/tle)
   if(FLAGTREE_BACKEND STREQUAL "ascend")
-    add_subdirectory(third_party/flir)
+    add_subdirectory(${FLIR_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/third_party/flir)
   endif()
   flagtree_add_flagprism_components()
   foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})

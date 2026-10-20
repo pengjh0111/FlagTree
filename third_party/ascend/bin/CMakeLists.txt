@@ -1,7 +1,7 @@
 get_property(triton_libs GLOBAL PROPERTY TRITON_LIBS)
 
 include_directories(
-    ${PROJECT_SOURCE_DIR}/third_party/ascend/AscendNPU-IR/bishengir/include
+    ${ASCENDNPU_IR_SRC_DIR}/bishengir/include
     ${PROJECT_BINARY_DIR}/third_party/ascend/AscendNPU-IR/bishengir/include
   )
 

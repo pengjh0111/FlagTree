@@ -12,6 +12,7 @@
 #include "incubated/Conversion/TritonToStructuredIncubated/Passes.h"
 #include "incubated/Conversion/TritonToUnstructureIncubated/Passes.h"
 #include "triton-shared/Conversion/TensorViewLowering/Passes.h"
+#include "triton-shared/Dialect/TensorView/IR/TensorViewBuilder.h"
 #include "triton-shared/Dialect/TensorView/IR/TensorViewDialect.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
@@ -189,4 +190,5 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
       mlir::tensor::TensorDialect, mlir::linalg::LinalgDialect,
       mlir::memref::MemRefDialect, mlir::bufferization::BufferizationDialect,
       mlir::func::FuncDialect>();
+  mlir::triton::tv::registerTritonPointerInterface(registry);
 }
